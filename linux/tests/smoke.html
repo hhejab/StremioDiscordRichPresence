@@ -1,0 +1,20 @@
+<!doctype html><title>Stremio presence regression test</title>
+<style>body {background:#23212c;color:white;font:24px sans-serif;padding:40px}</style>
+<p>Testing local playback and Discord presence. This window closes automatically.</p>
+<script>
+window.qt.webChannelTransport.onmessage = () => {};
+const send = (method, ...args) => window.ipc.postMessage(JSON.stringify({type:6,args:[method,...args]}));
+let episode=1;
+location.hash='#/player/stream/addon/meta/series/tt1234/tt1234%3A1%3A1';
+window.core={getState:async()=>({metaItem:{type:'Ready',content:{name:'Presence Test Series',releaseInfo:'2024',poster:'https://example.com/poster.jpg',videos:[{id:`tt1234:1:${episode}`,title:episode===1?'Pilot':'Second episode',season:1,episode,thumbnail:`https://example.com/episode${episode}.jpg`}]}},selected:{metaRequest:{path:{id:'tt1234',type:'series'}},streamRequest:{path:{id:`tt1234:1:${episode}`}}}})};
+const meta = title => send('media.metadata', {title,artist:'Presence Test Series',artUrl:'https://example.com/poster.jpg'});
+const load = () => {send('mpv-observe-prop','pause');send('mpv-command',['loadfile','TEST_MEDIA']);};
+setTimeout(() => { meta('Pilot (1x1)'); send('media.status',{paused:false}); load(); },1000);
+setTimeout(() => send('mpv-set-prop',['pause',true]),2500);
+setTimeout(() => send('mpv-set-prop',['pause',false]),3500);
+setTimeout(() => { episode=2;location.hash='#/player/stream/addon/meta/series/tt1234/tt1234%3A1%3A2';meta('Second episode (1x2)'); load(); },4500);
+setTimeout(() => send('mpv-command',['seek','5','absolute']),5500);
+setTimeout(() => send('mpv-command',['stop']),6500);
+setTimeout(() => { send('media.status',{paused:true}); send('discord-set-activity',{details:'STALE',state:'Watching',image:null}); },7000);
+setTimeout(() => send('quit'),8500);
+</script>

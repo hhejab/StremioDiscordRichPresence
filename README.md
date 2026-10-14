@@ -1,4 +1,28 @@
-# Discord Rich Presence for Stremio 4
+# Stremio Discord Rich Presence — Windows + Linux
+
+A fork of [Loukious/StremioDiscordRichPresence](https://github.com/Loukious/StremioDiscordRichPresence), adding a native Linux implementation for the GTK Stremio Linux shell.
+
+## Linux
+
+The Linux port runs inside Stremio and uses its actual MPV playback events. It connects automatically when Stremio opens, retries if Discord starts later, clears activity on stop/end/error, and disconnects when Stremio exits.
+
+Its Discord card includes:
+
+- Separate movie/show title and episode title with season/episode numbers.
+- Poster artwork and an episode thumbnail when present in Stremio's loaded metadata.
+- A pause indicator that stops the running timer.
+- Playback timing that updates after seeking, resuming, and changing playback speed.
+- IMDb and Stremio Web buttons when the corresponding media identifiers are available.
+
+It reads metadata that Stremio has already loaded. It does not request another metadata service, need an API key, or run a second background app.
+
+**Compatibility:** This version targets [Stremio/stremio-linux-shell](https://github.com/Stremio/stremio-linux-shell) revision `d7bb4e7795389f0d8cf96abe5f2574cee632698c`, tested on CachyOS. It does not support the older Qt Stremio 4 Linux client or playback handed to an external player. Windows builds retain the original implementation below.
+
+See [Linux installation and development](linux/README.md) for setup, requirements, tests, rollback, and the source patch.
+
+---
+
+# Original Windows implementation
 This is a simple mod that adds Discord Rich Presence support to Stremio 4. It shows the movie or series you are watching on Discord.
 For Stremio 5, please check out my other project [here](https://github.com/Loukious/stremio-shell-ng)
 
@@ -25,7 +49,7 @@ For Stremio 5, please check out my other project [here](https://github.com/Louki
 1. Locate the Stremio installation folder.
 > By default, for Stremio 4 it is `%localappdata%\Programs\LNV\Stremio-4`.
 
-2. Download the zip file for [Stremio 4](../../releases/latest) and extract it in your Stremio folder.
+2. Download the zip file for [Stremio 4](https://github.com/Loukious/StremioDiscordRichPresence/releases/latest) and extract it in your Stremio folder.
 3. Verify that your Discord Rich Presence is working.
 
 ## Configuring the mod

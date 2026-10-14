@@ -1,3 +1,6 @@
 .vs/*
 Release/*
 DWrite/*
+# Linux Python test/build helpers
+/linux/**/__pycache__/
+/linux/**/*.pyc

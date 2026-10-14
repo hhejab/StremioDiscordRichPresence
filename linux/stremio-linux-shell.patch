@@ -1,0 +1,1098 @@
+diff --git a/src/app/discord/config.rs b/src/app/discord/config.rs
+index 7f8e421..cc39811 100644
+--- a/src/app/discord/config.rs
++++ b/src/app/discord/config.rs
+@@ -1 +1 @@
+-pub const CLIENT_ID: &str = "1452620752263319665";
++pub const CLIENT_ID: &str = "997798118185771059";
+diff --git a/src/app/discord/mod.rs b/src/app/discord/mod.rs
+index 4717b59..ce5353a 100644
+--- a/src/app/discord/mod.rs
++++ b/src/app/discord/mod.rs
+@@ -1,62 +1,451 @@
+ mod config;
++pub mod metadata;
+ 
+-use std::cell::RefCell;
++use std::{
++    cell::RefCell,
++    sync::{
++        Arc,
++        atomic::{AtomicBool, Ordering},
++    },
++    thread,
++    time::{Duration, Instant},
++};
+ 
+ use discord_rich_presence::{
+     DiscordIpc, DiscordIpcClient,
+-    activity::{Activity, ActivityType, Assets},
++    activity::{Activity, ActivityType, Assets, Button, Timestamps},
+ };
+-use tracing::{error, warn};
++use flume::{Receiver, RecvTimeoutError, Sender};
++use tracing::{debug, warn};
+ 
+ use config::CLIENT_ID;
+ 
++const RETRY_INTERVAL: Duration = Duration::from_secs(15);
++
++#[derive(Clone, Debug, Default, PartialEq)]
++struct Presence {
++    details: String,
++    image: Option<String>,
++    paused: bool,
++    episode: Option<String>,
++    thumbnail: Option<String>,
++    hover_text: Option<String>,
++    imdb_url: Option<String>,
++    stremio_url: Option<String>,
++    timestamps: Option<(i64, Option<i64>)>,
++}
++
++fn bounded(value: &str) -> String {
++    let mut end = value.len().min(128);
++    while !value.is_char_boundary(end) {
++        end -= 1;
++    }
++    value[..end].to_owned()
++}
++
++fn image_url(value: Option<String>) -> Option<String> {
++    value.filter(|value| {
++        url::Url::parse(value).is_ok_and(|url| matches!(url.scheme(), "https" | "http"))
++    })
++}
++
++impl Presence {
++    fn activity(&self) -> Activity<'_> {
++        let hover = self.hover_text.as_deref().unwrap_or(&self.details);
++        let mut assets = Assets::new().large_text(bounded(hover));
++        if let Some(image) = &self.image {
++            assets = assets.large_image(image.clone());
++        }
++        if self.paused {
++            assets = assets
++                .small_image("https://i.imgur.com/eCUJpm9.png")
++                .small_text("Paused");
++        } else if let Some(thumbnail) = &self.thumbnail {
++            assets = assets
++                .small_image(thumbnail.clone())
++                .small_text(bounded(self.episode.as_deref().unwrap_or("Playing")));
++        } else {
++            assets = assets.small_image("https://raw.githubusercontent.com/Stremio/stremio-web/development/images/icon.png").small_text("Playing");
++        }
++        let state = match (&self.episode, self.paused) {
++            (Some(episode), true) => format!("Paused · {episode}"),
++            (Some(episode), false) => episode.clone(),
++            (None, true) => "Paused".into(),
++            (None, false) => "Watching".into(),
++        };
++        let mut activity = Activity::default()
++            .activity_type(ActivityType::Watching)
++            .details(bounded(&self.details))
++            .state(bounded(&state))
++            .assets(assets);
++        let mut buttons = vec![];
++        if let Some(url) = &self.imdb_url {
++            buttons.push(Button::new("More details", url.clone()));
++        }
++        if let Some(url) = &self.stremio_url {
++            buttons.push(Button::new("Watch on Stremio", url.clone()));
++        }
++        activity = activity.buttons(buttons);
++        if !self.paused
++            && let Some((start, end)) = self.timestamps
++        {
++            let mut timestamps = Timestamps::new().start(start);
++            if let Some(end) = end {
++                timestamps = timestamps.end(end);
++            }
++            activity = activity.timestamps(timestamps);
++        }
++        activity
++    }
++}
++
++#[derive(Default)]
++struct Playback {
++    active: bool,
++    loading: bool,
++    paused: bool,
++    metadata: Option<Presence>,
++    source_title: Option<String>,
++    position: Option<f64>,
++    duration: Option<f64>,
++    speed: f64,
++    clock: Option<(i64, Option<i64>)>,
++}
++
++impl Playback {
++    fn presence(&self) -> Option<Presence> {
++        if !self.active {
++            return None;
++        }
++        self.metadata.clone().map(|mut presence| {
++            presence.paused = self.paused;
++            presence.timestamps = (!self.paused).then_some(self.clock).flatten();
++            presence
++        })
++    }
++
++    fn update_clock(&mut self, now: i64) {
++        if self.paused || self.loading {
++            self.clock = None;
++            return;
++        }
++        let Some(position) = self.position else {
++            return;
++        };
++        let speed = if self.speed > 0.0 { self.speed } else { 1.0 };
++        let start = now - (position / speed).floor() as i64;
++        let end = self
++            .duration
++            .map(|duration| now + ((duration - position).max(0.0) / speed).ceil() as i64);
++        // Keep stable timestamps during normal playback; update on seek or speed
++        // change. MPV emits time-pos frequently, Discord must not receive every tick.
++        if self.clock.is_none_or(|(old_start, old_end)| {
++            (old_start - start).abs() > 2
++                || match (old_end, end) {
++                    (Some(old), Some(new)) => (old - new).abs() > 2,
++                    (a, b) => a != b,
++                }
++        }) {
++            self.clock = Some((start, end));
++        }
++    }
++}
++
++enum Command {
++    Update(Option<Presence>),
++    Enable(bool),
++    Shutdown,
++}
++
+ pub struct Discord {
+-    client: RefCell<DiscordIpcClient>,
++    playback: RefCell<Playback>,
++    sender: Sender<Command>,
++    connected: Arc<AtomicBool>,
+ }
+ 
+ impl Discord {
+     pub fn new() -> Self {
+-        let client = RefCell::new(DiscordIpcClient::new(CLIENT_ID));
+-
+-        Self { client }
++        let (sender, receiver) = flume::unbounded();
++        let connected = Arc::new(AtomicBool::new(false));
++        let status = connected.clone();
++        // The crate's handshake is blocking. Never do socket IO on GTK's thread.
++        thread::Builder::new()
++            .name("stremio-discord".into())
++            .spawn(move || {
++                run(
++                    receiver,
++                    status,
++                    DiscordIpcClient::new(
++                        std::env::var("STREMIO_DISCORD_CLIENT_ID")
++                            .unwrap_or_else(|_| CLIENT_ID.to_owned()),
++                    ),
++                    RETRY_INTERVAL,
++                )
++            })
++            .expect("Failed to start Discord worker");
++        Self {
++            playback: RefCell::default(),
++            sender,
++            connected,
++        }
+     }
+ 
+     pub fn connect(&self) -> bool {
+-        if let Err(e) = self.client.borrow_mut().connect() {
+-            warn!("Failed to connect: {e}");
+-            return false;
+-        }
+-
+-        true
++        self.sender.send(Command::Enable(true)).ok();
++        self.connected.load(Ordering::Relaxed)
+     }
+ 
+     pub fn disconnect(&self) {
+-        if let Err(e) = self.client.borrow_mut().close() {
+-            error!("Failed to disconnect: {e}");
++        self.sender.send(Command::Enable(false)).ok();
++    }
++
++    pub fn shutdown(&self) {
++        self.sender.send(Command::Shutdown).ok();
++    }
++
++    pub fn prepare_playback(&self) {
++        let mut playback = self.playback.borrow_mut();
++        playback.loading = true;
++        playback.position = None;
++        playback.duration = None;
++        playback.clock = None;
++        playback.paused = false;
++    }
++
++    pub fn playback_started(&self) {
++        let mut playback = self.playback.borrow_mut();
++        playback.active = true;
++        playback.loading = false;
++        drop(playback);
++        self.publish();
++    }
++
++    pub fn playback_ended(&self, reason: &str) {
++        // MPV redirects are part of the same playback (e.g. a playlist URL).
++        if reason != "redirect" {
++            let mut playback = self.playback.borrow_mut();
++            if playback.loading && reason == "stop" {
++                // loadfile replaces an existing stream with EndFile(stop), then
++                // StartFile. Metadata for the replacement may already be here.
++                playback.active = false;
++            } else {
++                *playback = Playback::default();
++            }
++            drop(playback);
++            self.publish();
+         }
+     }
+ 
+-    pub fn set_activity(&self, details: String, state: String, image: Option<String>) {
+-        let mut assets = Assets::new().large_text("Stremio");
++    pub fn set_paused(&self, paused: bool) {
++        let mut playback = self.playback.borrow_mut();
++        if playback.paused != paused {
++            playback.clock = None;
++        }
++        playback.paused = paused;
++        playback.update_clock(chrono::Utc::now().timestamp());
++        drop(playback);
++        self.publish();
++    }
+ 
+-        if let Some(image) = image {
+-            assets = assets.large_image(image);
++    pub fn set_metadata(&self, title: String, artist: Option<String>, image: Option<String>) {
++        let mut playback = self.playback.borrow_mut();
++        if playback.source_title.as_deref() != Some(&title) {
++            let (details, episode) =
++                match artist.filter(|artist| !artist.trim().is_empty() && artist != &title) {
++                    Some(artist) => (artist, Some(title.clone())),
++                    None => (title.clone(), None),
++                };
++            playback.metadata = (!details.trim().is_empty()).then_some(Presence {
++                details,
++                episode,
++                image: image_url(image),
++                ..Presence::default()
++            });
++            playback.source_title = Some(title);
+         }
++        drop(playback);
++        self.publish();
++    }
+ 
+-        let activity = Activity::default()
+-            .activity_type(ActivityType::Watching)
+-            .details(details)
+-            .state(state)
+-            .assets(assets);
++    pub fn set_rich_metadata(&self, metadata: metadata::MediaMetadata) {
++        let mut playback = self.playback.borrow_mut();
++        if let Some(presence) = &mut playback.metadata {
++            if let Some(name) = metadata.name.filter(|name| !name.trim().is_empty()) {
++                presence.details = name;
++            }
++            presence.episode = metadata
++                .episode
++                .filter(|episode| !episode.trim().is_empty())
++                .or(presence.episode.take());
++            if let Some(poster) = image_url(metadata.poster) {
++                presence.image = Some(poster);
++            }
++            presence.thumbnail = image_url(metadata.thumbnail);
++            presence.hover_text = Some(match metadata.year.filter(|year| !year.is_empty()) {
++                Some(year) => format!("{} ({year})", presence.details),
++                None => presence.details.clone(),
++            });
++            if let Some(id) = metadata.id {
++                if id.starts_with("tt")
++                    && id[2..].chars().all(|c| c.is_ascii_digit())
++                    && id.len() > 2
++                {
++                    presence.imdb_url = Some(format!("https://www.imdb.com/title/{id}/"));
++                }
++                if let Some(media_type) = metadata
++                    .media_type
++                    .filter(|kind| matches!(kind.as_str(), "movie" | "series"))
++                {
++                    let mut url = url::Url::parse("https://web.stremio.com/").unwrap();
++                    let encode = |value: &str| {
++                        url::form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>()
++                    };
++                    let path = format!(
++                        "/detail/{}/{}/{}",
++                        media_type,
++                        encode(&id),
++                        encode(metadata.video_id.as_deref().unwrap_or(&id))
++                    );
++                    url.set_fragment(Some(&path));
++                    let url = url.to_string();
++                    if url.len() <= 512 {
++                        presence.stremio_url = Some(url);
++                    }
++                }
++            }
++        }
++        drop(playback);
++        self.publish();
++    }
++
++    pub fn property_changed(&self, name: &str, value: &serde_json::Value) {
++        if name == "pause" {
++            if let Some(paused) = value.as_bool() {
++                self.set_paused(paused);
++            }
++            return;
++        }
++        let Some(value) = value
++            .as_f64()
++            .filter(|value| value.is_finite() && *value >= 0.0 && *value < 1e9)
++        else {
++            return;
++        };
++        let mut playback = self.playback.borrow_mut();
++        if !playback.active || playback.loading {
++            return;
++        }
++        match name {
++            "time-pos" => playback.position = Some(value),
++            "duration" => playback.duration = (value > 0.0).then_some(value),
++            "speed" if value > 0.0 => {
++                playback.speed = value;
++                playback.clock = None;
++            }
++            _ => return,
++        }
++        playback.update_clock(chrono::Utc::now().timestamp());
++        drop(playback);
++        self.publish();
++    }
+ 
+-        if let Err(e) = self.client.borrow_mut().set_activity(activity) {
+-            error!("Failed to set activity: {e}");
++    pub fn set_activity(&self, details: String, _state: String, image: Option<String>) {
++        // Native playback owns pause/stop. Keep legacy frontend activity as a
++        // fallback only; a late frontend message must not resurrect a stopped video.
++        let playback = self.playback.borrow();
++        let fallback = playback.active && playback.metadata.is_none();
++        drop(playback);
++        if fallback {
++            self.set_metadata(details, None, image);
+         }
+     }
+ 
+     pub fn clear_activity(&self) {
+-        if let Err(e) = self.client.borrow_mut().clear_activity() {
+-            error!("Failed to clear activity: {e}");
++        // Frontend cleanup can run while MPV is still playing. EndFile is the
++        // authoritative stop signal, not media.status or React effect cleanup.
++        if !self.playback.borrow().active {
++            self.sender.send(Command::Update(None)).ok();
+         }
+     }
++
++    fn publish(&self) {
++        self.sender
++            .send(Command::Update(self.playback.borrow().presence()))
++            .ok();
++    }
++}
++
++impl Drop for Discord {
++    fn drop(&mut self) {
++        self.shutdown();
++    }
+ }
++
++fn run<C: DiscordIpc>(
++    receiver: Receiver<Command>,
++    connected: Arc<AtomicBool>,
++    mut client: C,
++    retry_interval: Duration,
++) {
++    let mut enabled = true;
++    let mut desired: Option<Presence> = None;
++    let mut dirty = true;
++    let mut next_retry = Instant::now();
++    loop {
++        if enabled && !connected.load(Ordering::Relaxed) && Instant::now() >= next_retry {
++            next_retry = Instant::now() + retry_interval;
++            match client.connect() {
++                Ok(()) => {
++                    connected.store(true, Ordering::Relaxed);
++                    dirty = true;
++                }
++                Err(e) => debug!("Discord is unavailable: {e}"),
++            }
++        }
++        if enabled && connected.load(Ordering::Relaxed) && dirty {
++            let result = match &desired {
++                Some(presence) => client.set_activity(presence.activity()),
++                None => client.clear_activity(),
++            };
++            if let Err(e) = result {
++                warn!("Discord activity update failed; will reconnect: {e}");
++                client.close().ok();
++                connected.store(false, Ordering::Relaxed);
++            }
++            dirty = false;
++        }
++        match receiver.recv_timeout(retry_interval) {
++            Ok(Command::Update(presence)) => {
++                if desired != presence {
++                    desired = presence;
++                    dirty = true;
++                }
++            }
++            Ok(Command::Enable(value)) => {
++                if enabled != value {
++                    enabled = value;
++                    next_retry = Instant::now();
++                    if !enabled && connected.swap(false, Ordering::Relaxed) {
++                        client.clear_activity().ok();
++                        client.close().ok();
++                    }
++                }
++            }
++            Ok(Command::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
++            Err(RecvTimeoutError::Timeout) => {
++                // Refresh an active presence so a Discord restart is detected even
++                // when playback is paused and no further media events arrive.
++                dirty = desired.is_some();
++            }
++        }
++    }
++    if connected.swap(false, Ordering::Relaxed) {
++        client.clear_activity().ok();
++        client.close().ok();
++    }
++    // Do not join this worker on the UI thread: an unresponsive Discord handshake
++    // must not prevent app exit. Process exit also closes any remaining socket.
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/src/app/imp.rs b/src/app/imp.rs
+index 21c4a84..e6a59c7 100644
+--- a/src/app/imp.rs
++++ b/src/app/imp.rs
+@@ -1,4 +1,7 @@
+-use std::cell::{Cell, RefCell};
++use std::{
++    cell::{Cell, RefCell},
++    rc::Rc,
++};
+ 
+ use adw::{prelude::*, subclass::prelude::*};
+ use gtk::glib::{self, Properties, clone};
+@@ -32,6 +35,7 @@ pub struct Application {
+     startup_url: RefCell<String>,
+     #[property(get, set)]
+     decorations: Cell<bool>,
++    discord: RefCell<Option<Rc<Discord>>>,
+     tray: RefCell<Option<Tray>>,
+     mpris: RefCell<Option<Mpris>>,
+     window: RefCell<Option<Window>>,
+@@ -72,14 +76,15 @@ impl ApplicationImpl for Application {
+         let tray = Tray::default();
+         let video = Video::default();
+         let mpris = Mpris::default();
+-        let discord = Discord::new();
++        let discord = Rc::new(Discord::new());
++        *self.discord.borrow_mut() = Some(discord.clone());
+ 
+         let startup_url = self.startup_url.borrow();
+         let dev_mode = self.dev_mode.get();
+ 
+         let webview = WebView::default();
+-        webview.load_uri(&startup_url);
+         webview.inject_script(PRELOAD_SCRIPT);
++        webview.load_uri(&startup_url);
+         webview.dev_mode(dev_mode);
+ 
+         let window = Window::new(&app);
+@@ -88,14 +93,24 @@ impl ApplicationImpl for Application {
+         window.set_overlay(&webview);
+ 
+         video.connect_playback_started(clone!(
++            #[weak]
++            video,
++            #[strong]
++            discord,
+             #[weak]
+             mpris,
+             move || {
+                 mpris.start();
++                discord.playback_started();
++                for name in ["pause", "time-pos", "duration", "speed"] {
++                    video.observe_mpv_property(name.to_owned());
++                }
+             }
+         ));
+ 
+         video.connect_playback_ended(clone!(
++            #[strong]
++            discord,
+             #[weak]
+             window,
+             #[weak]
+@@ -103,6 +118,7 @@ impl ApplicationImpl for Application {
+             #[weak]
+             mpris,
+             move |reason| {
++                discord.playback_ended(reason);
+                 mpris.stop();
+                 window.enable_idling();
+ 
+@@ -116,9 +132,12 @@ impl ApplicationImpl for Application {
+         ));
+ 
+         video.connect_mpv_property_change(clone!(
++            #[strong]
++            discord,
+             #[weak]
+             webview,
+             move |name, value| {
++                discord.property_changed(name, &value);
+                 let message = ipc::create_response(IpcEvent::Mpv(IpcEventMpv::Change((
+                     name.to_string(),
+                     value,
+@@ -159,6 +178,7 @@ impl ApplicationImpl for Application {
+                             webview.send(&message);
+                         }
+                         IpcEvent::MediaStatus(status) => {
++                            discord.set_paused(status);
+                             mpris.set_status(status);
+ 
+                             if status {
+@@ -168,12 +188,16 @@ impl ApplicationImpl for Application {
+                             }
+                         }
+                         IpcEvent::MediaMetadata((title, artist, artwork)) => {
++                            discord.set_metadata(title.clone(), artist.clone(), artwork.clone());
+                             mpris.set_metadata(title, artist, artwork);
+                         }
+                         IpcEvent::Quit => {
+                             app.quit();
+                         }
+                         IpcEvent::Discord(event) => match event {
++                            IpcEventDiscord::Metadata(metadata) => {
++                                discord.set_rich_metadata(metadata)
++                            }
+                             IpcEventDiscord::Connect => {
+                                 let connected = discord.connect();
+                                 let message = ipc::create_response(IpcEvent::Discord(
+@@ -191,6 +215,9 @@ impl ApplicationImpl for Application {
+                         IpcEvent::Mpv(event) => match event {
+                             IpcEventMpv::Observe(name) => video.observe_mpv_property(name),
+                             IpcEventMpv::Command((name, args)) => {
++                                if name == "loadfile" {
++                                    discord.prepare_playback();
++                                }
+                                 video.send_mpv_command(name, args)
+                             }
+                             IpcEventMpv::Set((name, value)) => video.set_mpv_property(name, value),
+@@ -308,6 +335,10 @@ impl ApplicationImpl for Application {
+     }
+ 
+     fn shutdown(&self) {
++        if let Some(discord) = self.discord.take() {
++            discord.shutdown();
++        }
++
+         if let Some(window) = self.window.take() {
+             window.destroy();
+         }
+diff --git a/src/app/ipc/event.rs b/src/app/ipc/event.rs
+index 4f07337..7f8ad87 100644
+--- a/src/app/ipc/event.rs
++++ b/src/app/ipc/event.rs
+@@ -14,6 +14,7 @@ pub enum IpcEventMpv {
+ 
+ #[derive(Deserialize, Debug)]
+ pub enum IpcEventDiscord {
++    Metadata(crate::app::discord::metadata::MediaMetadata),
+     Status(bool),
+     Connect,
+     Disconnect,
+diff --git a/src/app/ipc/preload.js b/src/app/ipc/preload.js
+index fd19a5c..84cf8cb 100644
+--- a/src/app/ipc/preload.js
++++ b/src/app/ipc/preload.js
+@@ -1,3 +1,52 @@
++// Read Stremio's already-loaded player model. This bridge performs no network requests.
++const enrichDiscordMetadata = (() => {
++    let revision = 0;
++    return (message, post) => {
++        let event;
++        try { event = JSON.parse(message); } catch (_) { return; }
++        if (event.type !== 6 || event.args?.[0] !== 'media.metadata') return;
++        const media = event.args[1];
++        if (!media || typeof media.title !== 'string') return;
++        const currentRevision = ++revision;
++        const hash = location.hash;
++        const emit = value => {
++            if (revision === currentRevision && location.hash === hash) {
++                post(JSON.stringify({type:6,args:['discord-media-context',value]}));
++            }
++        };
++        // Some custom/test frontends only supply the standard media metadata.
++        if (typeof window.core?.getState !== 'function') return;
++        Promise.resolve().then(() => window.core.getState('player')).then(player => {
++            if (player?.metaItem?.type !== 'Ready') return;
++            const meta = player.metaItem.content;
++            const selected = player.selected;
++            const id = selected?.metaRequest?.path?.id || meta?.id;
++            const videoId = selected?.streamRequest?.path?.id || id;
++            const mediaType = selected?.metaRequest?.path?.type || meta?.type;
++            if (!meta || typeof id !== 'string' || typeof videoId !== 'string') return;
++            // A delayed snapshot must not enrich metadata for a different episode.
++            let route;
++            try { route = hash.split('?')[0].replace(/^#\/?/, '').split('/').map(decodeURIComponent); }
++            catch (_) { return; }
++            if (route[0] === 'player' && route.length === 7 && (route[5] !== id || route[6] !== videoId)) return;
++            const video = Array.isArray(meta.videos) ? meta.videos.find(video => video.id === videoId) : null;
++            const numbers = videoId.split(':');
++            const season = video?.season ?? numbers[1];
++            const episode = video?.episode ?? numbers[2];
++            const suffix = mediaType === 'series' && /^\d+$/.test(String(season)) && /^\d+$/.test(String(episode)) ? `S${season} · E${episode}` : null;
++            const title = video?.title || video?.name || (media.artist ? media.title.replace(/\s*\(\d+x\d+\)$/, '') : null);
++            emit({
++                id, videoId, mediaType,
++                name: typeof meta.name === 'string' ? meta.name : media.artist || media.title,
++                episode: title ? `${title}${suffix ? ` (${suffix})` : ''}` : suffix,
++                year: String(meta.releaseInfo || meta.year || ''),
++                poster: typeof meta.poster === 'string' ? meta.poster : null,
++                thumbnail: typeof video?.thumbnail === 'string' ? video.thumbnail : null,
++            });
++        }).catch(() => {}); // Core reloads must not interrupt playback or basic presence.
++    };
++})();
++
+ const createIpc = () => {
+     let listeners = [];
+ 
+@@ -9,6 +58,7 @@ const createIpc = () => {
+ 
+     const postMessage = (data) => {
+         globalThis.webkit.messageHandlers.ipc.postMessage(data);
++        enrichDiscordMetadata(data, value => globalThis.webkit.messageHandlers.ipc.postMessage(value));
+     };
+ 
+     const addEventListener = (name, listener) => {
+@@ -54,7 +104,9 @@ globalThis.chrome = {
+ };
+ 
+ window.ipc.addEventListener('message', (message) => {
+-    window.qt.webChannelTransport.onmessage(message);
++    if (typeof window.qt.webChannelTransport.onmessage === "function") {
++        window.qt.webChannelTransport.onmessage(message);
++    }
+ });
+ 
+ window.stremio_server_ipc_key = "LINUX";
+diff --git a/src/app/ipc/request.rs b/src/app/ipc/request.rs
+index 41230fb..fae5d98 100644
+--- a/src/app/ipc/request.rs
++++ b/src/app/ipc/request.rs
+@@ -110,6 +110,11 @@ impl TryFrom<IpcMessageRequest> for IpcEvent {
+ 
+                                 Ok(IpcEvent::MediaStatus(data.paused))
+                             }
++                            "discord-media-context" => {
++                                let metadata = serde_json::from_value(data)
++                                    .map_err(|_| "Invalid Discord media metadata")?;
++                                Ok(IpcEvent::Discord(IpcEventDiscord::Metadata(metadata)))
++                            }
+                             "discord-connect" => Ok(IpcEvent::Discord(IpcEventDiscord::Connect)),
+                             "discord-disconnect" => {
+                                 Ok(IpcEvent::Discord(IpcEventDiscord::Disconnect))
+diff --git a/src/app/discord/tests.rs b/src/app/discord/tests.rs
+new file mode 100644
+index 0000000..8c30433
+--- /dev/null
++++ b/src/app/discord/tests.rs
+@@ -0,0 +1,345 @@
++use super::*;
++use discord_rich_presence::error::Error;
++use serde_json::{Value, json};
++use std::sync::Mutex;
++
++fn controller() -> (Discord, Receiver<Command>) {
++    let (sender, receiver) = flume::unbounded();
++    (
++        Discord {
++            playback: RefCell::default(),
++            sender,
++            connected: Arc::new(AtomicBool::new(false)),
++        },
++        receiver,
++    )
++}
++
++#[test]
++fn metadata_before_start_pause_resume_stop_and_late_events() {
++    let (discord, _) = controller();
++    discord.set_metadata(
++        "Pilot (1x1)".into(),
++        Some("A series".into()),
++        Some("https://example.com/art.jpg".into()),
++    );
++    assert!(discord.playback.borrow().presence().is_none());
++    discord.playback_started();
++    let presence = discord.playback.borrow().presence().unwrap();
++    assert_eq!(presence.details, "A series");
++    assert_eq!(
++        presence.image.as_deref(),
++        Some("https://example.com/art.jpg")
++    );
++    assert!(!presence.paused);
++    discord.set_paused(true);
++    assert!(discord.playback.borrow().presence().unwrap().paused);
++    discord.clear_activity();
++    assert!(discord.playback.borrow().presence().is_some());
++    discord.set_paused(false);
++    assert!(!discord.playback.borrow().presence().unwrap().paused);
++    discord.playback_ended("stop");
++    discord.set_paused(true); // frontend cleanup is a pause, not another stop/start
++    discord.set_activity("Late title".into(), "Watching".into(), None);
++    assert!(discord.playback.borrow().presence().is_none());
++    discord.playback_started();
++    assert!(discord.playback.borrow().presence().is_none()); // no stale title
++}
++
++#[test]
++fn metadata_after_start_redirect_replacement_and_terminal_events() {
++    let (discord, _) = controller();
++    discord.playback_started();
++    discord.set_metadata("Movie".into(), None, None);
++    discord.playback_ended("redirect");
++    assert!(discord.playback.borrow().presence().is_some());
++    discord.set_metadata("Next episode (1x2)".into(), Some("Series".into()), None);
++    discord.prepare_playback();
++    discord.playback_ended("stop");
++    assert!(discord.playback.borrow().presence().is_none());
++    discord.playback_started();
++    assert_eq!(
++        discord.playback.borrow().presence().unwrap().details,
++        "Series"
++    );
++    for reason in ["eof", "error", "quit", "stop", "other"] {
++        discord.playback_started();
++        discord.set_metadata("Movie".into(), None, None);
++        discord.playback_ended(reason);
++        assert!(discord.playback.borrow().presence().is_none());
++        assert!(discord.playback.borrow().metadata.is_none());
++    }
++}
++
++#[test]
++fn payload_has_watching_type_pause_and_bounded_unicode() {
++    let presence = Presence {
++        details: "🎬".repeat(100),
++        image: None,
++        paused: true,
++        ..Presence::default()
++    };
++    let activity = serde_json::to_value(presence.activity()).unwrap();
++    assert_eq!(activity["type"], 3);
++    assert_eq!(activity["state"], "Paused");
++    assert_eq!(activity["details"].as_str().unwrap().len(), 128);
++    assert!(activity["assets"].get("large_image").is_none());
++}
++
++struct FakeClient {
++    events: Sender<Value>,
++    fail_write: Arc<AtomicBool>,
++    fail_connect: Arc<AtomicBool>,
++    last: Arc<Mutex<Option<Value>>>,
++}
++
++impl DiscordIpc for FakeClient {
++    fn connect(&mut self) -> Result<(), Error> {
++        self.events.send(json!("connect")).unwrap();
++        if self.fail_connect.load(Ordering::Relaxed) {
++            return Err(Error::IPCNotFound);
++        }
++        Ok(())
++    }
++    fn set_activity(&mut self, activity: Activity) -> Result<(), Error> {
++        if self.fail_write.swap(false, Ordering::Relaxed) {
++            return Err(Error::NotConnected);
++        }
++        let payload = serde_json::to_value(activity).unwrap();
++        *self.last.lock().unwrap() = Some(payload.clone());
++        self.events.send(payload).unwrap();
++        Ok(())
++    }
++    fn clear_activity(&mut self) -> Result<(), Error> {
++        self.events.send(Value::Null).unwrap();
++        Ok(())
++    }
++    fn close(&mut self) -> Result<(), Error> {
++        self.events.send(json!("close")).unwrap();
++        Ok(())
++    }
++    fn get_client_id(&self) -> &str {
++        CLIENT_ID
++    }
++    fn connect_ipc(&mut self) -> Result<(), Error> {
++        unreachable!()
++    }
++    fn write(&mut self, _: &[u8]) -> Result<(), Error> {
++        unreachable!()
++    }
++    fn read(&mut self, _: &mut [u8]) -> Result<(), Error> {
++        unreachable!()
++    }
++}
++
++#[test]
++fn worker_connects_deduplicates_disables_reconnects_and_cleans_up() {
++    let (sender, receiver) = flume::unbounded();
++    let (events, output) = flume::unbounded();
++    let connected = Arc::new(AtomicBool::new(false));
++    let client = FakeClient {
++        events,
++        fail_write: Arc::new(AtomicBool::new(false)),
++        fail_connect: Arc::new(AtomicBool::new(false)),
++        last: Arc::new(Mutex::new(None)),
++    };
++    let status = connected.clone();
++    let worker = thread::spawn(move || run(receiver, status, client, RETRY_INTERVAL));
++    let next = || output.recv_timeout(Duration::from_secs(2)).unwrap();
++    assert_eq!(next(), json!("connect"));
++    assert_eq!(next(), Value::Null);
++    let presence = Presence {
++        details: "A film".into(),
++        image: Some("https://example.com/poster.jpg".into()),
++        paused: false,
++        ..Presence::default()
++    };
++    sender
++        .send(Command::Update(Some(presence.clone())))
++        .unwrap();
++    let activity = next();
++    assert_eq!(activity["details"], "A film");
++    assert_eq!(
++        activity["assets"]["large_image"],
++        "https://example.com/poster.jpg"
++    );
++    sender
++        .send(Command::Update(Some(presence.clone())))
++        .unwrap();
++    sender.send(Command::Enable(false)).unwrap();
++    assert_eq!(next(), Value::Null); // duplicate update was not sent
++    assert_eq!(next(), json!("close"));
++    sender
++        .send(Command::Update(Some(Presence {
++            paused: true,
++            ..presence
++        })))
++        .unwrap();
++    sender.send(Command::Enable(true)).unwrap();
++    assert_eq!(next(), json!("connect"));
++    assert_eq!(next()["state"], "Paused");
++    sender.send(Command::Shutdown).unwrap();
++    assert_eq!(next(), Value::Null);
++    assert_eq!(next(), json!("close"));
++    worker.join().unwrap();
++    assert!(!connected.load(Ordering::Relaxed));
++}
++
++#[test]
++fn worker_recovers_when_discord_starts_late_and_after_a_broken_socket() {
++    let (sender, receiver) = flume::unbounded();
++    let (events, output) = flume::unbounded();
++    let fail_write = Arc::new(AtomicBool::new(false));
++    let fail_connect = Arc::new(AtomicBool::new(true));
++    let client = FakeClient {
++        events,
++        fail_write: fail_write.clone(),
++        fail_connect: fail_connect.clone(),
++        last: Arc::new(Mutex::new(None)),
++    };
++    let worker = thread::spawn(move || {
++        run(
++            receiver,
++            Arc::new(AtomicBool::new(false)),
++            client,
++            Duration::from_millis(30),
++        )
++    });
++    let next = || output.recv_timeout(Duration::from_secs(2)).unwrap();
++    assert_eq!(next(), json!("connect"));
++    sender
++        .send(Command::Update(Some(Presence {
++            details: "A movie".into(),
++            image: None,
++            paused: true,
++            ..Presence::default()
++        })))
++        .unwrap();
++    fail_connect.store(false, Ordering::Relaxed);
++    loop {
++        if next().is_object() {
++            break;
++        }
++    }
++    fail_write.store(true, Ordering::Relaxed);
++    loop {
++        if next() == json!("close") {
++            break;
++        }
++    }
++    assert_eq!(next(), json!("connect"));
++    let restored = next();
++    assert_eq!(restored["details"], "A movie");
++    assert_eq!(restored["state"], "Paused");
++    sender.send(Command::Shutdown).unwrap();
++    worker.join().unwrap();
++}
++
++#[test]
++fn rich_card_separates_title_episode_and_adds_artwork_buttons() {
++    let (discord, _) = controller();
++    discord.set_metadata("Pilot (1x1)".into(), Some("Series".into()), None);
++    discord.set_rich_metadata(metadata::MediaMetadata {
++        name: Some("Series".into()),
++        episode: Some("Pilot (S1 · E1)".into()),
++        year: Some("2024".into()),
++        poster: Some("https://example.com/poster.jpg".into()),
++        thumbnail: Some("https://example.com/episode.jpg".into()),
++        id: Some("tt1234".into()),
++        video_id: Some("tt1234:1:1".into()),
++        media_type: Some("series".into()),
++    });
++    discord.playback_started();
++    let payload =
++        serde_json::to_value(discord.playback.borrow().presence().unwrap().activity()).unwrap();
++    assert_eq!(payload["details"], "Series");
++    assert_eq!(payload["state"], "Pilot (S1 · E1)");
++    assert_eq!(
++        payload["assets"]["large_image"],
++        "https://example.com/poster.jpg"
++    );
++    assert_eq!(
++        payload["assets"]["small_image"],
++        "https://example.com/episode.jpg"
++    );
++    assert_eq!(payload["assets"]["large_text"], "Series (2024)");
++    assert_eq!(
++        payload["buttons"][0]["url"],
++        "https://www.imdb.com/title/tt1234/"
++    );
++    assert!(
++        payload["buttons"][1]["url"]
++            .as_str()
++            .unwrap()
++            .contains("tt1234%3A1%3A1")
++    );
++    discord.set_paused(true);
++    let payload =
++        serde_json::to_value(discord.playback.borrow().presence().unwrap().activity()).unwrap();
++    assert_eq!(payload["state"], "Paused · Pilot (S1 · E1)");
++    assert_eq!(payload["assets"]["small_text"], "Paused");
++}
++
++#[test]
++fn playback_clock_is_stable_seeks_and_speed_changes_update_it_and_pause_removes_it() {
++    let mut playback = Playback {
++        active: true,
++        metadata: Some(Presence {
++            details: "Movie".into(),
++            ..Presence::default()
++        }),
++        position: Some(30.0),
++        duration: Some(120.0),
++        speed: 1.0,
++        ..Playback::default()
++    };
++    playback.update_clock(1000);
++    assert_eq!(playback.clock, Some((970, Some(1090))));
++    playback.position = Some(31.0);
++    playback.update_clock(1001);
++    assert_eq!(playback.clock, Some((970, Some(1090))));
++    playback.position = Some(60.0);
++    playback.update_clock(1001);
++    assert_eq!(playback.clock, Some((941, Some(1061))));
++    let payload = serde_json::to_value(playback.presence().unwrap().activity()).unwrap();
++    assert_eq!(payload["timestamps"]["end"], 1061);
++    playback.paused = true;
++    playback.update_clock(1002);
++    assert!(playback.clock.is_none());
++    let payload = serde_json::to_value(playback.presence().unwrap().activity()).unwrap();
++    assert!(payload.get("timestamps").is_none());
++    playback.paused = false;
++    playback.speed = 2.0;
++    playback.update_clock(1010);
++    assert_eq!(playback.clock, Some((980, Some(1040))));
++}
++
++#[test]
++fn unknown_duration_invalid_clock_and_custom_metadata_have_safe_fallbacks() {
++    let (discord, _) = controller();
++    discord.set_metadata(
++        "Custom film".into(),
++        None,
++        Some("file:///private/path".into()),
++    );
++    discord.playback_started();
++    discord.property_changed("time-pos", &json!(-1));
++    assert!(discord.playback.borrow().clock.is_none());
++    discord.property_changed("time-pos", &json!(30));
++    assert!(discord.playback.borrow().clock.unwrap().1.is_none());
++    discord.set_rich_metadata(metadata::MediaMetadata {
++        id: Some("custom:abc".into()),
++        media_type: Some("movie".into()),
++        poster: Some("javascript:alert(1)".into()),
++        ..metadata::MediaMetadata::default()
++    });
++    let payload =
++        serde_json::to_value(discord.playback.borrow().presence().unwrap().activity()).unwrap();
++    assert_eq!(payload["details"], "Custom film");
++    assert!(payload["assets"].get("large_image").is_none());
++    assert_eq!(payload["buttons"].as_array().unwrap().len(), 1);
++    assert_eq!(payload["buttons"][0]["label"], "Watch on Stremio");
++    discord.playback_ended("eof");
++    discord.property_changed("time-pos", &json!(50));
++    assert!(discord.playback.borrow().presence().is_none());
++}
+diff --git a/src/app/discord/metadata.rs b/src/app/discord/metadata.rs
+new file mode 100644
+index 0000000..a27e58b
+--- /dev/null
++++ b/src/app/discord/metadata.rs
+@@ -0,0 +1,15 @@
++use serde::Deserialize;
++
++/// Additional display metadata supplied by the injected web bridge.
++#[derive(Debug, Default, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct MediaMetadata {
++    pub name: Option<String>,
++    pub episode: Option<String>,
++    pub year: Option<String>,
++    pub poster: Option<String>,
++    pub thumbnail: Option<String>,
++    pub id: Option<String>,
++    pub video_id: Option<String>,
++    pub media_type: Option<String>,
++}
